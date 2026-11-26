@@ -1,0 +1,250 @@
+%% ============================================================
+%% 03 · 时序图集合 · 华电学生手册 RAG 智能问答系统（一期）
+%% 流 1~4 提取自 docs/02-总体设计.md §5「关键数据流」
+%% 流 5~6 提取自 docs/03-详细设计技术方案.md §3.9.6、§3.9.7（JDK 21 虚拟线程视角）
+%% ============================================================
+
+
+%% ------------------------------------------------------------
+%% 流 1 · 一次问答的完整时序（含拒答分支）
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant U as 浏览器 Vue
+    participant J as Java 业务服务
+    participant P as Python RAG 服务
+    participant Q as Qdrant
+    participant L as 云端 LLM API
+
+    U->>J: POST /api/chat 携带 JWT
+    J->>J: JWT 校验 角色校验 问题长度校验
+    J->>J: 落库 chat_message 状态 PENDING 生成 trace_id
+    J->>P: gRPC Chat 携带 HMAC 五字段 Metadata
+    P->>P: HMAC 验签 时间窗与非重放校验
+    P->>P: guard 问题层违禁词过滤
+
+    alt 命中违禁词
+        P-->>J: ChatChunk event_type REFUSAL reason QUESTION_BANNED
+        P-->>J: ChatChunk event_type FINISHED
+        J->>J: chat_message 状态 REFUSED 不写引用
+        J-->>U: SSE refusal 事件 统一提示
+    else 未命中违禁词
+        P->>P: 领域边界判定
+        alt 超出校园制度范围
+            P-->>J: ChatChunk event_type REFUSAL reason OUT_OF_DOMAIN 携带统一引导语
+            P-->>J: ChatChunk event_type FINISHED
+            J->>J: chat_message 状态 REFUSED 不写引用
+            J-->>U: SSE refusal 事件 展示引导语 不展示引用区
+        else 在范围内
+            P->>P: 问题向量化
+            P->>Q: 向量检索 Top-K
+            Q-->>P: Top-K chunks 与 payload
+            P->>L: 流式请求 system 为 Skill 内容 user 为问题加片段
+            loop 流式 token 到达
+                L-->>P: token 增量
+                P-->>J: ChatChunk event_type CONTENT seq 递增
+                J-->>U: SSE content 事件 逐块追加
+            end
+            P->>P: 解析引用标记 回填 Citation 列表
+            P->>P: 答案层违禁词过滤
+            alt 答案命中违禁词
+                P-->>J: ChatChunk event_type REFUSAL reason ANSWER_BANNED
+            else 答案正常
+                P-->>J: ChatChunk event_type CITATION 携带 Citation 列表
+            end
+            P-->>J: ChatChunk event_type FINISHED
+            J->>J: 落库 chat_message 与 chat_citation 更新状态
+            J-->>U: SSE citation 与 done 事件
+        end
+    end
+
+
+%% ------------------------------------------------------------
+%% 流 2 · 文档入库时序（gRPC Client Streaming）
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant U as 管理后台 Vue
+    participant J as Java 业务服务
+    participant P as Python RAG 服务
+    participant FS as storage/documents
+    participant Q as Qdrant
+
+    U->>J: POST /api/admin/documents 上传 .md
+    J->>J: 校验 JWT 与 ADMIN 角色
+    J->>J: 校验扩展名白名单 流式计算整文件 sha256 与大小
+    alt 扩展名不在白名单 PDF 或 DOCX
+        J-->>U: 400 明确提示 暂不支持该格式
+    else 白名单通过
+        J->>J: 落库 doc_document 状态 UPLOADING
+        loop 按块读取文件 边读边发
+            J->>P: IngestDocument stream DocumentChunk seq 递增
+            P->>FS: 边收边写入 storage/documents/doc_id
+            FS-->>P: 写盘成功
+        end
+        J->>P: 最后一块 is_last 携带 sha256 与 DocumentMeta
+        P->>P: 校验落盘文件 sha256 与 meta seq 连续性
+        alt 摘要或格式校验失败
+            P-->>J: IngestResult success false 带 ErrorInfo
+            J->>J: doc_document 状态 FAILED 记录 error_message
+            J-->>U: 提示入库失败原因
+        else 校验通过
+            P->>P: MarkdownParser 解析标题层级
+            P->>P: chunker 章节分块加 overlap
+            P->>P: embedding 批量向量化
+            P->>Q: upsert 向量与 payload
+            Q-->>P: 写入成功
+            P-->>J: IngestResult success true 带 chunk_count
+            J->>J: doc_document 状态 SUCCESS 记录 chunk_count
+            J-->>U: 列表可见 状态成功
+        end
+    end
+
+
+%% ------------------------------------------------------------
+%% 流 3 · 文档删除时序
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant U as 管理后台 Vue
+    participant J as Java 业务服务
+    participant P as Python RAG 服务
+    participant FS as storage/documents
+    participant Q as Qdrant
+
+    U->>J: DELETE /api/admin/documents/id
+    J->>J: 校验 ADMIN 角色 查 doc_document 存在且状态允许删除
+    J->>J: doc_document 状态置 DELETING
+    J->>P: gRPC DeleteDocument document_id 与 trace_id
+    P->>Q: 按 payload.doc_id 过滤删除全部点 wait 为 true
+    Q-->>P: 删除点数 affected
+    P->>FS: 删除 storage/documents/doc_id 目录
+    FS-->>P: 删除结果
+    alt 任一环节失败
+        P-->>J: OperationResult success false 带 ErrorInfo
+        J->>J: 状态回退 FAILED 保留原因 供重试
+        J-->>U: 提示删除失败
+    else 全部成功
+        P-->>J: OperationResult success true affected_chunks
+        J->>J: doc_document 状态 DELETED 记录审计日志
+        J-->>U: 列表移除该文档
+    end
+
+
+%% ------------------------------------------------------------
+%% 流 4 · 健康检查
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant U as 管理后台或运维
+    participant J as Java 业务服务
+    participant P as Python RAG 服务
+    participant Q as Qdrant
+    participant L as 云端模型 API
+
+    U->>J: GET /api/admin/health
+    J->>J: 校验 ADMIN 角色
+    J->>P: gRPC HealthCheck deep 标志
+    P->>P: 检查自身进程与 Skill 加载状态
+    P->>Q: 探测 collection 是否可访问
+    Q-->>P: 可用或不可用
+    alt deep 为真
+        P->>L: 轻量连通性探测 使用最小请求
+        L-->>P: 可用或不可用
+    end
+    P-->>J: HealthResponse 含各依赖状态与版本
+    J-->>J: 聚合 Java 自身状态
+    J-->>U: 健康报告
+
+
+%% ------------------------------------------------------------
+%% 流 5 · 问答全链路 + 线程归属（JDK 21 虚拟线程视角）
+%% 提取自 docs/03-详细设计技术方案.md §3.9.6
+%% 用途：说明"一次问答从头到尾跑在哪些线程上"，供答辩讲解并发模型
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant B as 浏览器
+    participant N as Nginx
+    participant C as ChatController
+    participant S as ChatService
+    participant D as driver 虚拟线程
+    participant Q as SseSender 写手虚拟线程
+    participant G as gRPC 回调线程
+    participant P as Python rag-service
+    participant M as MySQL
+
+    B->>N: POST /api/chat 携带 JWT
+    N->>C: 反向代理到 /api
+    Note over C: Tomcat 虚拟线程
+    C->>S: prepare 用户与请求
+    S->>M: INSERT chat_message status=PENDING
+    S-->>C: 返回 messageId 与 traceId
+    C->>D: start ctx 提交到 SSE_EXECUTOR
+    D-->>C: 立即返回 SseEmitter
+    C-->>B: 200 text/event-stream
+    Note over C: 请求线程到此归还 不再参与本条流
+
+    D->>Q: 入队 started
+    Q-->>B: event started messageId traceId
+    D->>P: Chat 流式调用 异步 stub
+    Note over D: 发起后 park 在 done.await 上等待流结束
+
+    loop 每生成一个 token
+        P-->>G: onNext CONTENT
+        G->>Q: 入队 content
+        Q-->>B: event content delta seq
+    end
+
+    opt 命中边界或违禁词
+        P-->>G: onNext REFUSAL
+        G->>Q: 入队 refusal
+        Q-->>B: event refusal 统一引导语
+    end
+
+    P-->>G: onNext CITATION
+    G->>Q: 入队 citation
+    Q-->>B: event citation
+
+    P-->>G: onCompleted
+    G->>D: done.countDown
+    D->>Q: 入队 done
+    D->>Q: awaitDrainThenComplete
+    Q-->>B: event done
+    Q->>Q: shutdown 释放该虚拟线程
+    D->>M: finish 落库 status=OK 与 chat_citation
+    Note over D,Q: 两条虚拟线程结束 emitter 失去引用等待 GC
+
+
+%% ------------------------------------------------------------
+%% 流 6 · 文档上传链路 + 线程归属（同步占用，文件 IO 不可卸载）
+%% 提取自 docs/03-详细设计技术方案.md §3.9.7
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant A as 管理员浏览器
+    participant C as AdminDocumentController
+    participant S as DocumentService
+    participant F as 本地磁盘
+    participant P as Python rag-service
+    participant Qd as Qdrant
+    participant M as MySQL
+
+    A->>C: POST /api/admin/documents 上传文件
+    Note over C: Tomcat 虚拟线程 本请求全程同步占用
+    C->>S: upload 文件与元数据
+    S->>M: INSERT doc_document status=PENDING
+    S->>F: 第一遍 流式读取计算 sha256
+    Note over S,F: 文件 IO 为阻塞式 虚拟线程无法卸载 载体线程被占住
+    S->>P: IngestDocument 首帧 DocumentMeta 与 HMAC 签名
+    loop 每 512KB 一个分块
+        S->>F: 第二遍 读取分块
+        S->>P: DocumentChunk
+        Note over S: 网络写阻塞可卸载 磁盘读阻塞不可卸载
+    end
+    P->>P: 落盘并校验 sha256 后解析分块
+    P->>Qd: upsert 向量
+    P-->>S: IngestResult 含 chunk_count 与 chunks
+    S->>M: UPDATE status=SUCCESS 并批量 INSERT doc_chunk_meta
+    S-->>C: 返回处理结果
+    C-->>A: 200 status SUCCESS 与 chunkCount

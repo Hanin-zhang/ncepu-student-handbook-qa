@@ -1,0 +1,352 @@
+%% ============================================================
+%% 03 · 类图 · 华电学生手册 RAG 智能问答系统（一期）
+%% 提取自 docs/03-详细设计技术方案.md §3.2 / §4.2 / §6
+%% 说明：本图同时覆盖 Java 业务层、Python AI 层与数据模型，
+%%       用于课程交付约束 D-02「四类设计图与接口文档」中「架构图 / 类图」的交叉引用；
+%%       对应的 ER 图见 docs/02-总体设计.md §6.1。
+%% 编号口径：UD-01~UD-07 = 用户决策（00 号 §1.5）；D-01~D-04 = 课程交付约束（00 号 §6.4）。
+%% ============================================================
+
+classDiagram
+    direction LR
+
+    %% ---------------- Java 业务层：控制器 ----------------
+    class AuthController {
+        +login(LoginReq) LoginResp
+        +me() UserVO
+        +logout() void
+    }
+    class SessionController {
+        +list(PageQ) Page~SessionVO~
+        +create(CreateSessionReq) Long
+        +messages(Long, PageQ) Page~MessageVO~
+        +remove(Long) void
+    }
+    class ChatController {
+        +chat(ChatReq) SseEmitter
+    }
+    class AdminDocumentController {
+        +upload(MultipartFile) DocVO
+        +list(PageQ) Page~DocVO~
+        +detail(String) DocDetailVO
+        +remove(String) void
+    }
+    class AdminBannedWordController {
+        +list(PageQ) Page~BannedWordVO~
+        +create(BannedWordReq) BannedWordVO
+        +update(Long, BannedWordReq) BannedWordVO
+        +remove(Long) void
+    }
+    class AdminChatLogController {
+        +logs(ChatLogQ) Page~ChatLogVO~
+    }
+    class AdminHealthController {
+        +health(boolean) HealthVO
+    }
+
+    %% ---------------- Java 业务层：服务 ----------------
+    class AuthService {
+        +login(LoginReq) LoginResp
+        +loadByUsername(String) AuthUser
+    }
+    class JwtService {
+        +issue(AuthUser) String
+        +parse(String) AuthUser
+        +isBlacklisted(String) boolean
+    }
+    class SessionService {
+        +create(Long, String) Long
+        +listByUser(Long, PageQ) Page~SessionVO~
+        +assertOwner(Long, Long) void
+    }
+    class ChatService {
+        +prepare(AuthUser, ChatReq) ChatContext
+        +finish(ChatContext, String, List~Citation~, RefusalInfo, ErrorInfo) void
+    }
+    class SseStreamBridge {
+        +start(ChatContext) SseEmitter
+        -sendEvent(SseEmitter, String, Object) void
+    }
+    class DocumentService {
+        +upload(MultipartFile, AuthUser) DocVO
+        +markStatus(String, DocStatus, String) void
+        +delete(String) void
+    }
+    class BannedWordService {
+        +enabledSnapshot() List~BannedWord~
+        +snapshotVersion() long
+        +upsert(BannedWordReq) void
+        +delete(Long) void
+    }
+    class AuditService {
+        +record(String, String, String, Map, boolean) void
+    }
+    class RateLimitService {
+        +tryAcquire(String) boolean
+    }
+
+    %% ---------------- Java 业务层：基础设施 ----------------
+    class SecurityConfig {
+        +filterChain(HttpSecurity) SecurityFilterChain
+        +passwordEncoder() PasswordEncoder
+        +corsSource() CorsConfigurationSource
+    }
+    class JwtAuthFilter {
+        +doFilterInternal(req, resp, chain) void
+    }
+    class RateLimitFilter {
+        +doFilter(req, resp, chain) void
+    }
+    class RagServiceClient {
+        +chat(ChatRequest, StreamObserver~ChatChunk~) void
+        +ingest(String, Path, DocumentMeta) IngestResult
+        +delete(String) OperationResult
+        +health(boolean) HealthResponse
+    }
+    class HmacClientInterceptor {
+        +interceptCall(MethodDescriptor, CallOptions, Channel) Listener
+    }
+    class HmacSigner {
+        +canonical(String, long, String, String, String) String
+        +sign(String, String) String
+    }
+    class GrpcStatusMapper {
+        +map(StatusRuntimeException) ErrorCode
+        +toErrorInfo(Throwable) ErrorInfo
+    }
+    class ApiResponse {
+        +int code
+        +Object data
+        +String message
+        +String traceId
+    }
+
+    %% ---------------- Python AI 层 ----------------
+    class RagServiceServicer {
+        +Chat(ChatRequest, context) Iterator~ChatChunk~
+        +IngestDocument(iterator, context) IngestResult
+        +DeleteDocument(DeleteDocumentRequest, context) OperationResult
+        +HealthCheck(HealthRequest, context) HealthResponse
+    }
+    class HmacInterceptor {
+        +intercept_service(continuation, details) RpcMethodHandler
+    }
+    class NonceCache {
+        +put_if_absent(String, int) boolean
+        +sweep() void
+    }
+    class Pipeline {
+        +run_chat(ChatRequest) AsyncIterator~ChatChunk~
+        +run_ingest(DocumentMeta, Path) IngestResult
+    }
+    class BaseParser {
+        <<abstract>>
+        +supports(String) bool
+        +parse(bytes, String) ParsedDocument
+    }
+    class MarkdownParser {
+        +supports(String) bool
+        +parse(bytes, String) ParsedDocument
+    }
+    class Chunker {
+        +target_tokens
+        +max_tokens
+        +overlap_tokens
+        +split(ParsedDocument, dict) list~Chunk~
+    }
+    class EmbeddingProvider {
+        <<abstract>>
+        +dim int
+        +embed_batch(list) list
+    }
+    class CloudEmbeddingProvider {
+        +dim int
+        +embed_batch(list) list
+    }
+    class VectorRetriever {
+        +retrieve(String, int, float) list~RetrievedChunk~
+    }
+    class QdrantStore {
+        +ensure_collection(int) void
+        +upsert(list) void
+        +search(list, int, Object) list
+        +delete_by_doc(String) int
+    }
+    class Generator {
+        +build_messages(Skill, String, list, list) list
+        +generate(list) AsyncIterator~str~
+        +parse_citations(String, list) list~Citation~
+    }
+    class LLMProvider {
+        <<abstract>>
+        +stream_chat(list, dict) AsyncIterator~str~
+        +ping() bool
+    }
+    class CloudLLMProvider {
+        +stream_chat(list, dict) AsyncIterator~str~
+        +ping() bool
+    }
+    class Guard {
+        +check_question(String, list) GuardResult
+        +check_answer(String, list) GuardResult
+    }
+    class SkillLoader {
+        +load(String) Skill
+    }
+    class Skill {
+        +name String
+        +system_prompt String
+        +domain_keywords list
+        +out_domain_keywords list
+        +refusal_message String
+    }
+    class FileStore {
+        +open_writer(String) Writer
+        +verify_sha256(String, String) bool
+        +remove(String) void
+    }
+
+    %% ---------------- 数据模型 ----------------
+    class DocStatus {
+        <<enumeration>>
+        PENDING
+        UPLOADING
+        PROCESSING
+        SUCCESS
+        FAILED
+        DELETING
+        DELETED
+        UNSUPPORTED
+    }
+    class ChatEventType {
+        <<enumeration>>
+        CONTENT
+        CITATION
+        REFUSAL
+        ERROR
+        FINISHED
+    }
+    class RefusalReason {
+        <<enumeration>>
+        OUT_OF_DOMAIN
+        QUESTION_BANNED
+        ANSWER_BANNED
+        NO_CONTEXT
+    }
+    class ChatContext {
+        +messageId Long
+        +sessionId Long
+        +traceId String
+        +question String
+        +cancelGrpc() void
+    }
+    class Citation {
+        +docId String
+        +title String
+        +sectionPath String
+        +clause String
+        +version String
+        +chunkIndex int
+        +score float
+        +rank int
+    }
+    class Section {
+        +level int
+        +heading String
+        +section_path String
+        +text String
+        +order int
+    }
+    class ParsedDocument {
+        +title String
+        +sections list
+        +tables list
+        +code_blocks list
+    }
+    class Chunk {
+        +doc_id String
+        +title String
+        +section_path String
+        +version String
+        +source String
+        +permission String
+        +clause String
+        +chunk_index int
+        +text String
+        +token_count int
+    }
+    class RetrievedChunk {
+        +doc_id String
+        +section_path String
+        +text String
+        +score float
+    }
+
+    %% ---------------- 关系 ----------------
+    AuthController --> AuthService
+    SessionController --> SessionService
+    ChatController --> ChatService
+    ChatController --> SseStreamBridge
+    AdminDocumentController --> DocumentService
+    AdminBannedWordController --> BannedWordService
+    AdminChatLogController --> ChatService
+    AdminHealthController --> RagServiceClient
+
+    AuthService --> JwtService
+    AuthService ..> AuditService
+    ChatService --> SessionService
+    ChatService --> BannedWordService
+    ChatService --> RagServiceClient
+    ChatService ..> AuditService
+    ChatService ..> ChatContext
+    SseStreamBridge --> RagServiceClient
+    SseStreamBridge ..> ChatContext
+    DocumentService --> RagServiceClient
+    DocumentService ..> DocStatus
+    DocumentService ..> AuditService
+    RateLimitFilter --> RateLimitService
+
+    SecurityConfig ..> JwtAuthFilter
+    JwtAuthFilter --> JwtService
+    JwtAuthFilter ..> ApiResponse
+    RagServiceClient ..> HmacClientInterceptor
+    HmacClientInterceptor --> HmacSigner
+    RagServiceClient ..> GrpcStatusMapper
+    RagServiceClient ..> ChatEventType
+
+    RagServiceServicer --> HmacInterceptor
+    HmacInterceptor --> NonceCache
+    RagServiceServicer --> Pipeline
+    RagServiceServicer --> FileStore
+    RagServiceServicer ..> QdrantStore
+
+    Pipeline --> Guard
+    Pipeline --> VectorRetriever
+    Pipeline --> Generator
+    Pipeline --> EmbeddingProvider
+    Pipeline --> SkillLoader
+    Pipeline ..> ChatEventType
+    Pipeline ..> RefusalReason
+    Pipeline ..> Citation
+
+    Generator --> LLMProvider
+    Generator ..> Citation
+    Generator ..> SkillLoader
+    VectorRetriever --> QdrantStore
+    VectorRetriever --> EmbeddingProvider
+    VectorRetriever ..> RetrievedChunk
+    EmbeddingProvider <|-- CloudEmbeddingProvider
+    LLMProvider <|-- CloudLLMProvider
+
+    SkillLoader --> Skill
+    SkillLoader ..> BaseParser
+    Pipeline --> Chunker
+    Chunker ..> Chunk
+    Chunker ..> ParsedDocument
+    BaseParser <|-- MarkdownParser
+    MarkdownParser ..> ParsedDocument
+    ParsedDocument *-- Section
+    Chunk ..> RetrievedChunk
+
+    %% 跨层：Java 与 Python 通过 proto 契约通信（同一 ChatChunk 事件类型）
+    RagServiceClient ..> ChatEventType : gRPC ChatChunk

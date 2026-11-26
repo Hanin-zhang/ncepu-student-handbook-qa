@@ -1,0 +1,291 @@
+name: CI
+
+# 触发条件：推送到主分支 / 所有 PR / 手动触发
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 最小权限：CI 只需要读代码
+permissions:
+  contents: read
+
+# 同一分支的新提交会取消上一次未跑完的任务，避免排队浪费
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. 探测：三个板块是否已创建
+  #    目前仓库里只有 docs/，java-service、python-rag、web 尚未创建，
+  #    因此下面三个 job 都会因 `if` 不满足而被跳过（灰色，不算失败）。
+  #    等对应目录出现后，自动开始跑，无需改这个文件。
+  # ---------------------------------------------------------------------------
+  detect:
+    name: 探测模块
+    runs-on: ubuntu-latest
+    outputs:
+      java: ${{ steps.check.outputs.java }}
+      python: ${{ steps.check.outputs.python }}
+      web: ${{ steps.check.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查各板块是否存在
+        id: check
+        run: |
+          set -euo pipefail
+
+          # Java：以构建脚本或 Gradle Wrapper 的存在为准
+          if [ -f java-service/build.gradle ] \
+            || [ -f java-service/build.gradle.kts ] \
+            || [ -f java-service/gradlew ]; then
+            echo "java=true" >> "$GITHUB_OUTPUT"
+            JAVA_STATE="✅ 已存在，将执行编译与单测"
+          else
+            echo "java=false" >> "$GITHUB_OUTPUT"
+            JAVA_STATE="⏭️ 未创建（缺少 java-service/build.gradle 或 gradlew）"
+          fi
+
+          # Python：以依赖声明或 tests 目录为准
+          if [ -f python-rag/requirements.txt ] \
+            || [ -f python-rag/pyproject.toml ] \
+            || [ -d python-rag/tests ]; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+            PY_STATE="✅ 已存在，将执行单测"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+            PY_STATE="⏭️ 未创建（缺少 python-rag/requirements.txt 或 pyproject.toml）"
+          fi
+
+          # Web：以 package.json 的存在为准
+          if [ -f web/package.json ]; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+            WEB_STATE="✅ 已存在，将执行构建与前端测试"
+          else
+            echo "web=false" >> "$GITHUB_OUTPUT"
+            WEB_STATE="⏭️ 未创建（缺少 web/package.json）"
+          fi
+
+          # 把探测结果写进 Job Summary，一眼看出"是模块没建，不是测试挂了"
+          {
+            echo "## CI 模块探测结果"
+            echo ""
+            echo "| 板块 | 预期目录 | 状态 |"
+            echo "|---|---|---|"
+            echo "| Java 业务服务 | \`java-service/\` | $JAVA_STATE |"
+            echo "| Python RAG 服务 | \`python-rag/\` | $PY_STATE |"
+            echo "| 前端 | \`web/\` | $WEB_STATE |"
+            echo ""
+            echo "> 未创建的板块会被跳过（显示为 skipped），不会让流水线变红。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 1. Java：Spring Boot 3 + Gradle
+  # ---------------------------------------------------------------------------
+  java:
+    name: Java 业务服务
+    needs: detect
+    if: needs.detect.outputs.java == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21（LTS）：虚拟线程在 21 正式转正（JEP 444），无需 --enable-preview。
+      # 版本已在 03 号 §3.9 定稿（技术文档 §3.1 允许 17/21，本项目取 21）。
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # setup-gradle 会优先用仓库里的 gradlew，没有则用当前稳定版 Gradle，并自带依赖缓存
+      - name: 准备 Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+
+      - name: 确认 JDK 版本不低于 21
+        working-directory: java-service
+        run: |
+          set -euo pipefail
+          java -version
+          # 只要低于 21，虚拟线程就不可用（21 之前是预览特性），直接拦在这里
+          java -version 2>&1 | grep -qE 'version "2[1-9]\.' || {
+            echo "::error::当前 JDK 低于 21，虚拟线程不可用"
+            exit 1
+          }
+
+      - name: 编译并运行单元测试
+        working-directory: java-service
+        env:
+          # 强制让测试跑在虚拟线程上：Spring Boot 的 relaxed binding 会把
+          # SPRING_THREADS_VIRTUAL_ENABLED 映射到 spring.threads.virtual.enabled，
+          # 环境变量会被 Gradle 的 test worker 继承，因此能覆盖配置文件里的值。
+          # 如果哪天有人把配置改回平台线程，CI 仍按虚拟线程跑，行为差异会在这里暴露。
+          SPRING_THREADS_VIRTUAL_ENABLED: 'true'
+        run: |
+          set -euo pipefail
+          if [ -x ./gradlew ]; then
+            ./gradlew --no-daemon --stacktrace clean test
+          else
+            gradle --no-daemon --stacktrace clean test
+          fi
+
+      # 失败时把测试报告带出来，否则只能看日志猜
+      - name: 上传测试报告（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-test-reports
+          path: java-service/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. Python：RAG 服务（grpc.aio + Qdrant + LLM Provider）
+  # ---------------------------------------------------------------------------
+  python:
+    name: Python RAG 服务
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 用 actions/cache 而不是 setup-python 的 cache 参数：
+      # 后者在依赖文件缺失时会直接报错，而这里 hashFiles 为空也只是缓存不命中
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('python-rag/requirements*.txt', 'python-rag/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: 安装依赖
+        working-directory: python-rag
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install -e .
+          fi
+          # 测试框架单独装，避免项目依赖里漏掉
+          pip install pytest pytest-asyncio pytest-cov
+
+      # proto 是 Java/Python 的共享契约，单独校验它能否编译，
+      # 这样即使业务代码还没写，契约写错也能第一时间发现
+      - name: 校验 .proto 可编译
+        working-directory: .
+        run: |
+          set -euo pipefail
+          PROTO=""
+          for p in python-rag/proto/rag_service.proto proto/rag_service.proto; do
+            if [ -f "$p" ]; then PROTO="$p"; break; fi
+          done
+          if [ -z "$PROTO" ]; then
+            echo "::notice::未找到 rag_service.proto，跳过契约校验"
+            exit 0
+          fi
+          echo "校验 $PROTO"
+          python -m pip install grpcio-tools
+          mkdir -p /tmp/proto_check
+          python -m grpc_tools.protoc -I "$(dirname "$PROTO")" \
+            --python_out=/tmp/proto_check \
+            --grpc_python_out=/tmp/proto_check \
+            "$PROTO"
+          ls -1 /tmp/proto_check
+
+      - name: 运行单元测试
+        working-directory: python-rag
+        run: |
+          set -uo pipefail
+          if [ -d tests ]; then
+            # pytest 在"未收集到用例"时退出码是 5，这不算失败（模块刚搭好还没写用例）
+            python -m pytest -q --maxfail=1
+            code=$?
+            if [ "$code" -eq 5 ]; then
+              echo "::notice::tests/ 存在但未收集到用例，按跳过处理"
+              exit 0
+            fi
+            exit "$code"
+          else
+            echo "::notice::python-rag/tests 不存在，退化为语法检查"
+            python -m compileall -q .
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 3. Web：Vue 3 + TypeScript + Element Plus（Vite）
+  # ---------------------------------------------------------------------------
+  web:
+    name: 前端
+    needs: detect
+    if: needs.detect.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 缓存 npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('web/package-lock.json', 'web/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: 安装依赖
+        working-directory: web
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            # 尚无 lock 文件时退回 install，并提示后续应提交 lock
+            echo "::notice::web/package-lock.json 不存在，使用 npm install；建议后续提交 lock 文件以启用 npm ci"
+            npm install --no-audit --no-fund
+          fi
+
+      # --if-present：脚本不存在就跳过，不会失败（框架还没搭好时也能过）
+      - name: 类型检查
+        working-directory: web
+        run: npm run type-check --if-present
+
+      - name: 构建
+        working-directory: web
+        run: npm run build --if-present
+
+      - name: 运行前端测试
+        working-directory: web
+        env:
+          # Vitest / Jest 在 CI 环境下都会自动退出 watch 模式
+          CI: 'true'
+        run: npm run test --if-present
+
+      - name: 上传构建产物（失败时排查用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build-logs
+          path: |
+            web/dist/
+            web/npm-debug.log
+          if-no-files-found: ignore
+          retention-days: 7
