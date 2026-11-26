@@ -1,6 +1,7 @@
 %% ============================================================
 %% 03 · 时序图集合 · 华电学生手册 RAG 智能问答系统（一期）
-%% 提取自 docs/02-总体设计.md §5「关键数据流」四张图
+%% 流 1~4 提取自 docs/02-总体设计.md §5「关键数据流」
+%% 流 5~6 提取自 docs/03-详细设计技术方案.md §3.9.6、§3.9.7（JDK 21 虚拟线程视角）
 %% ============================================================
 
 
@@ -154,3 +155,96 @@ sequenceDiagram
     P-->>J: HealthResponse 含各依赖状态与版本
     J-->>J: 聚合 Java 自身状态
     J-->>U: 健康报告
+
+
+%% ------------------------------------------------------------
+%% 流 5 · 问答全链路 + 线程归属（JDK 21 虚拟线程视角）
+%% 提取自 docs/03-详细设计技术方案.md §3.9.6
+%% 用途：说明"一次问答从头到尾跑在哪些线程上"，供答辩讲解并发模型
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant B as 浏览器
+    participant N as Nginx
+    participant C as ChatController
+    participant S as ChatService
+    participant D as driver 虚拟线程
+    participant Q as SseSender 写手虚拟线程
+    participant G as gRPC 回调线程
+    participant P as Python rag-service
+    participant M as MySQL
+
+    B->>N: POST /api/chat 携带 JWT
+    N->>C: 反向代理到 /api
+    Note over C: Tomcat 虚拟线程
+    C->>S: prepare 用户与请求
+    S->>M: INSERT chat_message status=PENDING
+    S-->>C: 返回 messageId 与 traceId
+    C->>D: start ctx 提交到 SSE_EXECUTOR
+    D-->>C: 立即返回 SseEmitter
+    C-->>B: 200 text/event-stream
+    Note over C: 请求线程到此归还 不再参与本条流
+
+    D->>Q: 入队 started
+    Q-->>B: event started messageId traceId
+    D->>P: Chat 流式调用 异步 stub
+    Note over D: 发起后 park 在 done.await 上等待流结束
+
+    loop 每生成一个 token
+        P-->>G: onNext CONTENT
+        G->>Q: 入队 content
+        Q-->>B: event content delta seq
+    end
+
+    opt 命中边界或违禁词
+        P-->>G: onNext REFUSAL
+        G->>Q: 入队 refusal
+        Q-->>B: event refusal 统一引导语
+    end
+
+    P-->>G: onNext CITATION
+    G->>Q: 入队 citation
+    Q-->>B: event citation
+
+    P-->>G: onCompleted
+    G->>D: done.countDown
+    D->>Q: 入队 done
+    D->>Q: awaitDrainThenComplete
+    Q-->>B: event done
+    Q->>Q: shutdown 释放该虚拟线程
+    D->>M: finish 落库 status=OK 与 chat_citation
+    Note over D,Q: 两条虚拟线程结束 emitter 失去引用等待 GC
+
+
+%% ------------------------------------------------------------
+%% 流 6 · 文档上传链路 + 线程归属（同步占用，文件 IO 不可卸载）
+%% 提取自 docs/03-详细设计技术方案.md §3.9.7
+%% ------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    participant A as 管理员浏览器
+    participant C as AdminDocumentController
+    participant S as DocumentService
+    participant F as 本地磁盘
+    participant P as Python rag-service
+    participant Qd as Qdrant
+    participant M as MySQL
+
+    A->>C: POST /api/admin/documents 上传文件
+    Note over C: Tomcat 虚拟线程 本请求全程同步占用
+    C->>S: upload 文件与元数据
+    S->>M: INSERT doc_document status=PENDING
+    S->>F: 第一遍 流式读取计算 sha256
+    Note over S,F: 文件 IO 为阻塞式 虚拟线程无法卸载 载体线程被占住
+    S->>P: IngestDocument 首帧 DocumentMeta 与 HMAC 签名
+    loop 每 512KB 一个分块
+        S->>F: 第二遍 读取分块
+        S->>P: DocumentChunk
+        Note over S: 网络写阻塞可卸载 磁盘读阻塞不可卸载
+    end
+    P->>P: 落盘并校验 sha256 后解析分块
+    P->>Qd: upsert 向量
+    P-->>S: IngestResult 含 chunk_count 与 chunks
+    S->>M: UPDATE status=SUCCESS 并批量 INSERT doc_chunk_meta
+    S-->>C: 返回处理结果
+    C-->>A: 200 status SUCCESS 与 chunkCount
