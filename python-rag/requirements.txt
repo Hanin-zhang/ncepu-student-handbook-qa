@@ -1,0 +1,10 @@
+# 运行时依赖（P01 只用到配置校验 + proto 生成；其余在 P02 起按阶段追加）
+# 版本组合与 java-service/pom.xml 的 <protoc.version> 必须一致（Q-22）
+grpcio==1.62.3
+grpcio-tools==1.62.3
+protobuf==4.25.9
+pydantic==2.8.2
+pydantic-settings==2.4.0
+
+# 测试
+pytest==8.2.2

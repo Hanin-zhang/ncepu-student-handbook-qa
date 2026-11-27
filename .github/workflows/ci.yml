@@ -19,8 +19,8 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------------------
   # 0. 探测：三个板块是否已创建
-  #    目前仓库里只有 docs/，java-service、python-rag、web 尚未创建，
-  #    因此下面三个 job 都会因 `if` 不满足而被跳过（灰色，不算失败）。
+  #    目前仓库里 java-service 仅含 P01 骨架，python-rag 已有配置与用例，
+  #    web 尚未创建，因此 web 的 job 会因 `if` 不满足而被跳过（灰色，不算失败）。
   #    等对应目录出现后，自动开始跑，无需改这个文件。
   # ---------------------------------------------------------------------------
   detect:
@@ -38,15 +38,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Java：以构建脚本或 Gradle Wrapper 的存在为准
-          if [ -f java-service/build.gradle ] \
-            || [ -f java-service/build.gradle.kts ] \
-            || [ -f java-service/gradlew ]; then
+          # Java：以 Maven 构建脚本或 Wrapper 的存在为准
+          if [ -f java-service/pom.xml ] \
+            || [ -f java-service/mvnw ]; then
             echo "java=true" >> "$GITHUB_OUTPUT"
             JAVA_STATE="✅ 已存在，将执行编译与单测"
           else
             echo "java=false" >> "$GITHUB_OUTPUT"
-            JAVA_STATE="⏭️ 未创建（缺少 java-service/build.gradle 或 gradlew）"
+            JAVA_STATE="⏭️ 未创建（缺少 java-service/pom.xml 或 mvnw）"
           fi
 
           # Python：以依赖声明或 tests 目录为准
@@ -83,7 +82,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # 1. Java：Spring Boot 3 + Gradle
+  # 1. Java：Spring Boot 3 + Maven（UD-09：构建工具为 Maven，不用 Gradle）
   # ---------------------------------------------------------------------------
   java:
     name: Java 业务服务
@@ -101,12 +100,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-
-      # setup-gradle 会优先用仓库里的 gradlew，没有则用当前稳定版 Gradle，并自带依赖缓存
-      - name: 准备 Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: current
+          cache: maven
 
       - name: 确认 JDK 版本不低于 21
         working-directory: java-service
@@ -119,21 +113,19 @@ jobs:
             exit 1
           }
 
-      - name: 编译并运行单元测试
+      # generate-sources 会先用 protoc 生成 gRPC 代码；test 再做编译与单测。
+      # 用 -B（批处理输出）+ -ntp（不打印下载进度）让日志可读。
+      - name: 生成 proto 代码、编译并运行单元测试
         working-directory: java-service
         env:
           # 强制让测试跑在虚拟线程上：Spring Boot 的 relaxed binding 会把
           # SPRING_THREADS_VIRTUAL_ENABLED 映射到 spring.threads.virtual.enabled，
-          # 环境变量会被 Gradle 的 test worker 继承，因此能覆盖配置文件里的值。
+          # 环境变量会被 Maven Surefire 的 fork 进程继承，因此能覆盖配置文件里的值。
           # 如果哪天有人把配置改回平台线程，CI 仍按虚拟线程跑，行为差异会在这里暴露。
           SPRING_THREADS_VIRTUAL_ENABLED: 'true'
         run: |
           set -euo pipefail
-          if [ -x ./gradlew ]; then
-            ./gradlew --no-daemon --stacktrace clean test
-          else
-            gradle --no-daemon --stacktrace clean test
-          fi
+          mvn -B -ntp clean generate-sources test
 
       # 失败时把测试报告带出来，否则只能看日志猜
       - name: 上传测试报告（失败时）
@@ -141,7 +133,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: java-test-reports
-          path: java-service/build/reports/tests/
+          path: java-service/target/surefire-reports/
           if-no-files-found: ignore
           retention-days: 7
 

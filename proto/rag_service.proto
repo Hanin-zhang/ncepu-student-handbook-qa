@@ -1,0 +1,281 @@
+// =============================================================================
+// 华电学生手册 RAG 智能问答系统 · gRPC 契约（唯一来源）
+//
+// 依据：docs/03-详细设计技术方案.md §2.2（完整可编译版本）
+// 约束：Java 与 Python 两侧均由本文件生成代码，禁止各存一份（NFR-16）
+//       生成方式：Java = mvn generate-sources（pom.xml）
+//                 Python = make proto（python-rag/Makefile）
+// 版本：契约 v1（P01 冻结）
+// =============================================================================
+
+syntax = "proto3";
+
+package rag;
+
+// Java 生成选项：包根与 03 §3.1 的 com.ncepu.rag.* 一致，生成物单独放 .grpc 子包
+option java_package = "com.ncepu.rag.grpc";
+option java_outer_classname = "RagServiceProto";
+option java_multiple_files = true;
+
+// ---------------------------------------------------------------------------
+// 服务定义：4 个 RPC，签名与 S2 §7.2 一致，不改名、不改流式类型
+// 【源：技术文档 §7.2】
+// ---------------------------------------------------------------------------
+service RagService {
+
+  // 问答：Python 流式返回生成内容 + 引用 + 拒答 + 错误 + 结束
+  // 流式类型：Server Streaming
+  // 调用方：Java gRPC Client；被调方：Python gRPC Server
+  // 【源：技术文档 §7.2、§8】【源：PRD FR-25】
+  rpc Chat(ChatRequest) returns (stream ChatChunk);
+
+  // 文档入库：Java 分块上传文件，Python 边收边写盘
+  // 流式类型：Client Streaming
+  // 【源：技术文档 §7.2、§8.1】【源：PRD FR-07】
+  rpc IngestDocument(stream DocumentChunk) returns (IngestResult);
+
+  // 删除文档：同时清理向量与原文件
+  // 流式类型：Unary
+  // 【源：技术文档 §7.2】【源：PRD FR-11】
+  rpc DeleteDocument(DeleteDocumentRequest) returns (OperationResult);
+
+  // 健康检查
+  // 流式类型：Unary
+  // 【源：技术文档 §7.2】【源：PRD FR-41】
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+}
+
+// ===========================================================================
+// 公共枚举与结构
+// ===========================================================================
+
+// 流式事件类型。
+// 扩展依据：S2 §7.3「更细粒度的流式事件类型」【源：技术文档 §7.3】
+// 一期取值：CONTENT / CITATION / REFUSAL / ERROR / FINISHED
+// 预留（二期）：RETRIEVAL_TRACE（暴露检索过程，供演示与调试）
+enum ChatEventType {
+  CHAT_EVENT_UNSPECIFIED = 0;   // 未设置，服务端必须不发送此值
+  CHAT_EVENT_CONTENT     = 1;   // 正常答案内容增量，content 字段有值
+  CHAT_EVENT_CITATION    = 2;   // 引用来源列表，citations 字段有值
+  CHAT_EVENT_REFUSAL     = 3;   // 拒答（领域边界外 / 违禁词命中），refusal 字段有值
+  CHAT_EVENT_ERROR       = 4;   // 真异常，error 字段有值
+  CHAT_EVENT_FINISHED    = 5;   // 本轮结束，finished 字段为 true
+  CHAT_EVENT_RETRIEVAL_TRACE = 6; // 预留：二期暴露检索细节，一期不发送
+}
+
+// 拒答原因。拒答不是错误，因此单独枚举而非复用 ErrorInfo。【设计裁决：见 03 §8.3】
+enum RefusalReason {
+  REFUSAL_REASON_UNSPECIFIED     = 0;
+  REFUSAL_REASON_OUT_OF_DOMAIN   = 1; // 超出校园制度范围（FR-29）
+  REFUSAL_REASON_QUESTION_BANNED = 2; // 问题层违禁词命中（FR-31）
+  REFUSAL_REASON_ANSWER_BANNED   = 3; // 答案层违禁词命中（FR-31）
+  REFUSAL_REASON_NO_CONTEXT      = 4; // 检索无有效依据 / 模型未产出引用（见 03 §4.5）
+}
+
+// 检索模式。二期 BM25/RRF 接入后使用，一期固定为 VECTOR。【待确认 Q-18】
+enum RetrievalMode {
+  RETRIEVAL_MODE_UNSPECIFIED = 0;
+  RETRIEVAL_MODE_VECTOR      = 1;  // 一期唯一取值
+  RETRIEVAL_MODE_HYBRID      = 2;  // 二期 BM25 + RRF
+}
+
+// 通用错误状态。仅表达「调用失败」，不表达业务拒答。【源：技术文档 §7.3「错误状态」】
+message ErrorInfo {
+  string code        = 1; // 错误码，与 03 §8.1 的字符串码对齐，如 RAG_TIMEOUT
+  string message     = 2; // 面向开发者的描述，不含堆栈、不含 Secret
+  bool   retryable   = 3; // 是否可重试：超时/不可用为 true，参数错误为 false
+  string detail_code = 4; // 更细的二级码，可为空，用于前端精细化提示
+}
+
+// 引用来源。对齐 T-12 的 6 个元数据 + 展示所需字段。
+// 【源：技术文档 §5.2 T-12 + §7.3「引用来源」（推导）】【源：PRD FR-26】
+message Citation {
+  string doc_id       = 1;  // 文档业务主键
+  string title        = 2;  // 文档标题（文件名）。§7.3 待补：文档元数据
+  string section_path = 3;  // 章节路径，如「第三章 学籍管理 > 转专业」
+  string clause       = 4;  // 条款编号，如「第 12 条」，抽不到时为空
+  string source       = 5;  // 来源说明
+  string version      = 6;  // 文档版本。§7.3 待补：文档版本信息
+  // 字段编号 7 已废弃（原 Citation.permission）——引用展示不需要权限标记，
+  // permission 只存在于 chunk 元数据与 Qdrant payload 中；保留编号不复用，见 03 §2.2.1。
+  reserved 7;
+  int32  chunk_index = 8;   // 分块序号，便于回溯原文位置
+  float  score       = 9;   // 相似度分数，一期仅记录，不参与排序。【待确认 Q-18】
+  string snippet     = 10;  // 命中片段摘要，供前端「查看原文」用
+  int32  rank        = 11;  // 展示顺序，从 1 开始
+}
+
+// 拒答信息。message 必须是统一引导语，保证多次拒答文案一致（FR-30）。
+// 【源：PRD FR-30】
+message RefusalInfo {
+  RefusalReason reason  = 1; // 拒答原因枚举
+  string        message = 2; // 统一引导话术，取自 Skill 配置，不在代码里硬编码
+}
+
+// 多轮对话历史项。
+// 一期是否启用取决于 Q-09；Proto 先定义以便二期不改契约。
+// 【待确认 Q-09】
+message HistoryTurn {
+  string role    = 1; // "user" 或 "assistant"
+  string content = 2; // 该轮内容
+}
+
+// 检索参数。一期只使用 top_k，其余为二期预留。【待确认 Q-18】
+message RetrievalOptions {
+  int32         top_k           = 1; // 一期默认由 Python 配置决定，客户端可覆盖
+  float         score_threshold = 2; // 一期默认 0 表示不过滤（见 03 §4.4）
+  RetrievalMode mode            = 3; // 一期**恒为 RETRIEVAL_MODE_VECTOR**，Python 侧断言该值；
+                                     // 消费者：`retriever.py`（校验并透传到 RetrievedChunk.mode）。
+                                     // 二期启用 RETRIEVAL_MODE_HYBRID（BM25+RRF）。【待确认 Q-18】
+}
+
+// ===========================================================================
+// Chat
+// ===========================================================================
+
+message ChatRequest {
+  string user_id    = 1; // 用户标识（Java 已鉴权，Python 不再校验身份）
+  string session_id = 2; // 会话标识，供日志串联与（可选）多轮上下文
+  string question   = 3; // 用户问题原文
+  string trace_id   = 4; // §7.3 待补：请求追踪信息，全链路同值
+
+  repeated HistoryTurn history = 5; // 多轮上下文，一期可为空【待确认 Q-09】
+  RetrievalOptions retrieval   = 6; // 检索参数，可空
+
+  repeated string user_roles   = 7; // 用户角色码。**消费点**：Python 在 WARN/审计级结构化日志中
+                                    // 记录"本次问答的角色快照"，用于事后排查越权风险（FR-40）；
+                                    // 一期**不参与**检索过滤（UD-07），也不做任何权限判断。
+  // 注：若 Q-09 确认一期不做多轮，history 字段恒为空但仍保留（避免二期改契约）。
+
+  // 违禁词表（方案 A-3-b：由 Java 随请求传入）。
+  // 理由：Python 不直连 Java 业务库（02 B-04），且 FR-33 要求词表变更对后续问答即时生效。
+  // 【设计裁决：存储与传递方式文档未规定】【待确认 Q-07】
+  repeated BannedWord banned_words = 8;
+  int64 banned_words_version       = 9; // 词表版本号，Python 侧可用于只读缓存失效判断
+}
+
+// 违禁词条目。由 Java 从 MySQL banned_word 表读出后随请求下发。
+message BannedWord {
+  string word       = 1; // 词条
+  string scope      = 2; // QUESTION / ANSWER / BOTH
+  string match_type = 3; // EXACT / CONTAINS（正则是否支持【待确认 Q-07】）
+}
+
+message ChatChunk {
+  // ---- 兼容字段（S2 §7.2 原骨架，保留语义）----
+  string content  = 1; // 仅当 event_type = CONTENT 时有值，为增量片段
+  bool   finished = 2; // 仅当 event_type = FINISHED 时为 true
+
+  // ---- 扩展字段（依据 S2 §7.3）----
+  ChatEventType event_type     = 3; // §7.3 待补：更细粒度的流式事件类型
+  repeated Citation citations  = 4; // 仅 CITATION 事件有值
+  RefusalInfo refusal          = 5; // 仅 REFUSAL 事件有值
+  ErrorInfo   error            = 6; // 仅 ERROR 事件有值
+  string trace_id              = 7; // §7.3 待补：请求追踪信息，回填原值便于对账
+  int32  seq                   = 8; // 事件序号，从 1 递增，用于前端乱序容错与丢帧检测
+  int64  emitted_at_ms         = 9; // 事件产生时间（epoch 毫秒）。**消费点**：Java `SseStreamBridge`
+                                    // 用它算「首块延迟」与「相邻帧间隔」并写入应用日志（结构化字段
+                                    // `first_chunk_ms` / `frame_gap_ms`），供 NFR-01 的流式体验观测；
+                                    // 该值不进 SSE 帧、不入库。
+}
+
+// ===========================================================================
+// IngestDocument
+// ===========================================================================
+
+// 文档元数据。§7.3 待补：文档权限信息 / 文档版本信息 / 文档元数据
+// 只在流的首帧携带。【源：技术文档 §7.3】【源：PRD FR-09】
+message DocumentMeta {
+  string title       = 1; // 文档标题，用于引用展示
+  string version     = 2; // 文档版本，默认 v1，语义见 Q-12【待确认 Q-12】
+  string source      = 3; // 来源说明
+  string permission  = 4; // 权限标记，一期仅落库不参与过滤【UD-07】
+  string uploader_id = 5; // 上传人，供审计
+  string mime_type   = 6; // text/markdown 或 text/plain
+  int64  size_bytes  = 7; // 整文件字节数，供 Python 侧校验是否收全
+}
+
+message DocumentChunk {
+  string document_id = 1; // 文档业务主键，Java 生成 UUID
+  bytes  content     = 2; // 文件内容分块
+  string file_name   = 3; // 原始文件名（首帧有效，后续帧可重复携带以便幂等）
+  int32  seq         = 4; // 分块序号，从 1 递增，用于检测丢帧/乱序
+  bool   is_last     = 5; // 是否最后一块
+  string sha256      = 6; // 整文件 SHA-256（十六进制小写）。§7.3 待补：文件摘要
+                          // 仅最后一块携带；Python 收完后比对落盘文件摘要
+  DocumentMeta meta  = 7; // 文档元数据，仅首帧携带
+  string trace_id    = 8; // §7.3 待补：请求追踪信息
+}
+
+// 单块元数据（分块清单项）。Python 在分块完成时逐块产出，随 IngestResult 一次性回传。
+// **消费点**：Java `DocumentService` 批量写入 MySQL `doc_chunk_meta`，供管理后台展示
+// 「某文档被拆成哪些块、各对应哪一章/节/条款」以便人工核对分块质量。
+// 不含正文：正文在 Qdrant payload 中，本结构只承载定位信息。
+message ChunkBrief {
+  int32  chunk_index     = 1; // 块序号，从 0 开始，与 Qdrant payload 同值
+  string section_path    = 2; // 章节路径，如「第三章 学籍管理 > 第二节 转专业」
+  string clause          = 3; // 条款编号（抽不到为空串）
+  string qdrant_point_id = 4; // 对应 Qdrant 点 ID，供人工反查
+  int32  token_count     = 5; // 该块 Token 数，供分块参数调优
+}
+
+message IngestResult {
+  bool      success     = 1; // 是否成功
+  string    document_id = 2; // 回显
+  string    message     = 3; // 人类可读结果描述
+  int32     chunk_count = 4; // 实际入库分块数，供 Java 记录
+  ErrorInfo error       = 5; // success=false 时有值
+  string    trace_id    = 6; // 回显
+  int64     elapsed_ms  = 7; // Python 侧处理总耗时。**消费点**：Java `DocumentService` 将其写入
+                             // `audit_log.detail.elapsed_ms`（action=DOC_UPLOAD），用于入库耗时观测；
+                             // 不入 `doc_document` 表（该表无此列）。
+  // 分块清单。**消费点**：Java `DocChunkMetaMapper` 批量插入 `doc_chunk_meta`。
+  // 约束：chunks.size() 必须等于 chunk_count；success=false 时为空。
+  // 设计理由：`doc_chunk_meta` 是「分块清单表」，若不入此字段则该表无数据源，
+  // 管理后台的「分块预览」将无内容可显示（见 02 §6.2.7）。
+  // 【设计裁决：S2 §7.2 未定义该字段，属对一期契约的补充，依据 02 §6.2.7 的用途反推】
+  repeated ChunkBrief chunks = 8;
+}
+
+// ===========================================================================
+// DeleteDocument
+// ===========================================================================
+
+message DeleteDocumentRequest {
+  string document_id = 1; // 待删除文档
+  string trace_id    = 2; // §7.3 待补：请求追踪信息
+  string operator_id = 3; // 操作人，供审计（Python 只落日志，不改业务表）
+}
+
+message OperationResult {
+  bool      success         = 1; // 是否成功
+  string    message         = 2; // 描述
+  int32     affected_chunks = 3; // 删除的向量点数
+  ErrorInfo error           = 4; // success=false 时有值
+  string    trace_id        = 5; // 回显
+}
+
+// ===========================================================================
+// HealthCheck
+// ===========================================================================
+
+message HealthRequest {
+  string trace_id = 1; // §7.3 待补：请求追踪信息
+  bool   deep     = 2; // true 时额外探测 LLM/Embedding API 连通性（会产生外部调用）
+}
+
+message DependencyStatus {
+  string name       = 1; // qdrant / llm_api / embedding_api / storage / skill
+  bool   healthy    = 2; // 是否可用
+  string detail     = 3; // 失败原因，脱敏
+  int64  latency_ms = 4; // 探测耗时
+}
+
+message HealthResponse {
+  bool   healthy      = 1; // 总体是否可用（任一必需依赖不可用即为 false）
+  string service      = 2; // 服务名固定 rag-service
+  string version      = 3; // 服务版本，取自构建信息
+  repeated DependencyStatus dependencies = 4; // 各依赖状态
+  string trace_id     = 5; // 回显
+  int64  timestamp_ms = 6; // 服务端时间，便于排查 NTP 偏差
+}
