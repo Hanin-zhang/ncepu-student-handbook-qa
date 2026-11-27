@@ -171,10 +171,10 @@ PY
   sleep 0.3
 done
 
-# 先 test-compile：避免某些情况下 Maven 增量编译判定"无变更"而跳过编译，
-# 导致 surefire 拿到不完整的 target/classes（实测出现过一次 NoClassDefFoundError）
-(cd "$JAVA_DIR" && mvn -B -ntp -q test-compile)
-(cd "$JAVA_DIR" && mvn -B -ntp -q test \
+# 这里同样用 clean：实测在第 4 步之后紧接着跑，偶发 NoClassDefFoundError: AppProperties
+# （类文件存在但加载失败），单独重跑又正常——典型的增量产物不可靠。
+# 脚本的存在意义是"结论确定"，多花几秒重新编译，好过让人怀疑代码。
+(cd "$JAVA_DIR" && mvn -B -ntp -q clean test \
   -Dtest=RagServiceDownIT -Dp02.down=true -Dp02.host=127.0.0.1 -Dp02.port="$PORT" -Dp02.ca="$CA")
 ok "e2e_rag_down 通过（UNAVAILABLE → 3001）"
 
