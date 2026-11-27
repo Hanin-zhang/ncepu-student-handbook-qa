@@ -9,6 +9,9 @@ import jakarta.validation.constraints.NotNull;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 /**
  * 配置项脚手架（03 §9.1 的 Java 侧全量环境变量）。
  *
@@ -68,6 +71,24 @@ public record AppProperties(
             @AssertTrue(message = "RAG_TLS_ENABLED 不得为 false：一期禁止明文 gRPC（NFR-03）")
             public boolean isEnabledRequired() {
                 return enabled;
+            }
+
+            /**
+             * CA 文件必须**真的存在且可读**——路径非空不等于文件可用（P02 补的洞）。
+             *
+             * <p>只校验非空时，服务会带着一个不存在的路径启动成功，等到第一次建 TLS 连接
+             * 才炸；那时的报错通常是 {@code SSLHandshakeException}，看起来像"网络不通"，
+             * 排查成本极高。这里把问题提前到启动阶段，并明确指出是哪个变量。
+             *
+             * <p>caPath 为空时返回 true：空值由上面的 {@code @NotBlank} 负责报错，
+             * 这里不重复报同一条问题。
+             */
+            @AssertTrue(message = "RAG_TLS_CA_PATH 指向的 CA 文件不存在或不可读（路径非空 ≠ 文件可用）")
+            public boolean isCaFileReadable() {
+                if (caPath == null || caPath.isBlank()) {
+                    return true;
+                }
+                return Files.isReadable(Path.of(caPath));
             }
         }
 

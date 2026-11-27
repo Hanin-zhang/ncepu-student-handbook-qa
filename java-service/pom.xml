@@ -121,6 +121,30 @@
         </configuration>
       </plugin>
 
+      <!--
+        ★ 必须显式包含 **/*IT.java。
+
+        Surefire 默认只匹配 *Test / Test* / *Tests / *TestCase，名字以 IT 结尾的
+        集成用例**一个都不会执行**——而脚本又打印"集成用例通过"，形成典型的假绿。
+        P02 首次联调就踩了：verify-p02.sh 第 4 步全绿，实际 RagServiceClientIT 从未运行。
+
+        这些 IT 自身用 @EnabledIfSystemProperty 控制是否启用（默认跳过），
+        所以加进 surefire 不会让日常 `mvn test` 变慢，也不会在无服务环境下失败。
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <includes>
+            <include>**/Test*.java</include>
+            <include>**/*Test.java</include>
+            <include>**/*Tests.java</include>
+            <include>**/*TestCase.java</include>
+            <include>**/*IT.java</include>
+          </includes>
+        </configuration>
+      </plugin>
+
       <!-- 打可执行 fat jar（java -jar 启动）；缺它则 jar 无 Main-Class，无法验证「启动即校验」 -->
       <plugin>
         <groupId>org.springframework.boot</groupId>

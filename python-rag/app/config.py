@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
-from pydantic import Field, ValidationError
+import os
+from pathlib import Path
+
+from pydantic import Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 字段名 → 环境变量名。用于把 pydantic 的 missing 错误翻译成用户看得懂的变量名。
@@ -32,13 +35,19 @@ _SECRET_FIELDS = frozenset(
     {"hmac_secret", "qdrant_api_key", "embedding_api_key", "llm_api_key"}
 )
 
+# 需要在启动时确认「文件真实存在且可读」的字段（P02 起 TLS 真正用到它们）。
+_PHASE1_FILE_FIELDS: dict[str, str] = {
+    "grpc_tls_cert_path": "GRPC_TLS_CERT_PATH",
+    "grpc_tls_key_path": "GRPC_TLS_KEY_PATH",
+}
+
 
 class ConfigError(RuntimeError):
-    """必填环境变量缺失。消息里必须包含变量名，供启动日志与运维排查直接定位。"""
+    """配置校验失败。消息里必须包含**环境变量名**，供启动日志与运维排查直接定位。"""
 
-    def __init__(self, missing: list[str]) -> None:
-        self.missing = missing
-        super().__init__("缺少必填环境变量: " + ", ".join(missing))
+    def __init__(self, problems: list[str]) -> None:
+        self.problems = problems
+        super().__init__("；".join(problems))
 
 
 class Settings(BaseSettings):
@@ -93,6 +102,28 @@ class Settings(BaseSettings):
     skill_name: str = "campus-policy-qa"
     log_level: str = "INFO"
 
+    @model_validator(mode="after")
+    def _check_cert_files(self) -> "Settings":
+        """证书/私钥必须**真的存在且可读**，光有非空字符串不算通过。
+
+        这是 P01 遗留的洞：路径非空 ≠ 文件可用。如果只校验非空，TLS 初始化会推迟到
+        P02 建 Server 时才抛错，而那时的报错通常长得像"握手失败/网络不通"，
+        排查成本极高。这里在启动阶段就把话说清楚，并带上环境变量名。
+        """
+        problems: list[str] = []
+        for field_name, env_name in _PHASE1_FILE_FIELDS.items():
+            raw = getattr(self, field_name)
+            if not raw:
+                continue  # 空值由 Field(...) 的 missing 校验负责，不在这里重复报
+            path = Path(raw)
+            if not path.is_file():
+                problems.append(f"{env_name} 指向的文件不存在: {path}")
+            elif not os.access(path, os.R_OK):
+                problems.append(f"{env_name} 指向的文件不可读: {path}")
+        if problems:
+            raise ValueError("；".join(problems))
+        return self
+
     def masked_summary(self) -> str:
         """返回一行脱敏摘要，供启动日志使用（不含任何 Secret 值）。"""
         pairs = [
@@ -112,16 +143,30 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    """读取并校验环境变量；缺必填项时抛 :class:`ConfigError`，消息含变量名。"""
+    """读取并校验环境变量；任何校验失败都抛 :class:`ConfigError`，消息含变量名。
+
+    错误分两类，都要报出来，不能只报一类：
+    * ``missing`` —— 必填项没配（翻译成环境变量名）；
+    * 其余（如文件不存在）—— pydantic 的 value_error，消息里已经带变量名。
+    """
     try:
         return Settings()
     except ValidationError as exc:
         missing: list[str] = []
+        others: list[str] = []
         for err in exc.errors():
-            if err.get("type") != "missing":
-                continue
-            field = str(err["loc"][0])
-            missing.append(FIELD_TO_ENV.get(field, field.upper()))
+            if err.get("type") == "missing":
+                field = str(err["loc"][0])
+                missing.append(FIELD_TO_ENV.get(field, field.upper()))
+            else:
+                message = str(err.get("msg", "")).replace("Value error, ", "")
+                if message:
+                    others.append(message)
+
+        problems: list[str] = []
         if missing:
-            raise ConfigError(missing) from exc
+            problems.append("缺少必填环境变量: " + ", ".join(sorted(set(missing))))
+        problems.extend(others)
+        if problems:
+            raise ConfigError(problems) from exc
         raise

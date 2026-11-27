@@ -1,6 +1,8 @@
 package com.ncepu.rag.config;
 
 import com.ncepu.rag.RagApplication;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -9,6 +11,9 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.context.ConfigurableApplicationContext;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,6 +43,32 @@ class AppPropertiesStartupTest {
      */
     private static final Map<String, String> REQUIRED_ENV_TO_PROPERTY = createRequiredMapping();
 
+    /**
+     * 测试用 CA 证书（{@code src/test/resources/tls/test-ca.crt}）。
+     *
+     * <p>P02 起只校验「文件存在」不够了：{@code GrpcClientConfig} 会真的把它装进
+     * trustManager，内容不是合法证书时启动就会失败。所以测试夹具必须是**真证书**，
+     * 不能用随便几个字节凑数。夹具是公开证书（不含私钥），放 resources 里没有泄密风险；
+     * 它由 {@code scripts/gen-dev-certs.sh} 生成，到期（2027-11）重新生成一份即可。
+     */
+    private static Path caFile;
+
+    @BeforeAll
+    static void createCaFile() throws IOException {
+        caFile = Files.createTempFile("rag-ca", ".crt");
+        try (var in = AppPropertiesStartupTest.class.getResourceAsStream("/tls/test-ca.crt")) {
+            assertThat(in).as("缺少测试证书夹具 src/test/resources/tls/test-ca.crt").isNotNull();
+            Files.copy(in, caFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    @AfterAll
+    static void deleteCaFile() throws IOException {
+        if (caFile != null) {
+            Files.deleteIfExists(caFile);
+        }
+    }
+
     private static Map<String, String> createRequiredMapping() {
         Map<String, String> map = new LinkedHashMap<>();
         map.put("HMAC_KEY_ID", "app.hmac.key-id");
@@ -57,7 +88,7 @@ class AppPropertiesStartupTest {
         args.add("--app.hmac.secret=dummy-secret-for-test");
         args.add("--app.jwt.secret=0123456789abcdef0123456789abcdef");
         args.add("--app.rag.host=127.0.0.1");
-        args.add("--app.rag.tls.ca-path=/tmp/rag-ca.pem");
+        args.add("--app.rag.tls.ca-path=" + caFile);
         args.add("--app.cors.allowed-origins=http://localhost:5173");
         return args;
     }
@@ -73,7 +104,7 @@ class AppPropertiesStartupTest {
         args.add("--server.port=0");
         args.add("--app.hmac.key-id=k1");
         args.add("--app.rag.host=127.0.0.1");
-        args.add("--app.rag.tls.ca-path=/tmp/rag-ca.pem");
+        args.add("--app.rag.tls.ca-path=" + caFile);
         args.add("--app.cors.allowed-origins=http://localhost:5173");
         return args;
     }
@@ -173,6 +204,21 @@ class AppPropertiesStartupTest {
 
         assertThat(failure).as("RAG_TLS_ENABLED=false 时必须启动失败，而不是带着明文 gRPC 跑起来").isNotNull();
         assertThat(allMessages(failure)).as("失败信息必须指向 RAG_TLS_ENABLED").contains("RAG_TLS_ENABLED");
+    }
+
+    @Test
+    @DisplayName("test_config_required_missing: CA 文件不存在时启动失败（P02 补洞）")
+    void caFileMissingFailsFast() {
+        List<String> args = allRequiredArgs().stream()
+                .filter(a -> !a.startsWith("--app.rag.tls.ca-path="))
+                .collect(Collectors.toList());
+        args.add("--app.rag.tls.ca-path=/nonexistent/definitely-not-here.pem");
+
+        Throwable failure = catchThrowable(() -> nonWebApp().run(args.toArray(String[]::new)));
+
+        assertThat(failure).as("CA 文件不存在时必须启动失败，而不是等到握手时才报 SSLHandshakeException")
+                .isNotNull();
+        assertThat(allMessages(failure)).as("失败信息必须指向 RAG_TLS_CA_PATH").contains("RAG_TLS_CA_PATH");
     }
 
     @Test
