@@ -177,28 +177,19 @@ jobs:
           # 测试框架单独装，避免项目依赖里漏掉
           pip install pytest pytest-asyncio pytest-cov
 
-      # proto 是 Java/Python 的共享契约，单独校验它能否编译，
-      # 这样即使业务代码还没写，契约写错也能第一时间发现
-      - name: 校验 .proto 可编译
-        working-directory: .
-        run: |
-          set -euo pipefail
-          PROTO=""
-          for p in python-rag/proto/rag_service.proto proto/rag_service.proto; do
-            if [ -f "$p" ]; then PROTO="$p"; break; fi
-          done
-          if [ -z "$PROTO" ]; then
-            echo "::notice::未找到 rag_service.proto，跳过契约校验"
-            exit 0
-          fi
-          echo "校验 $PROTO"
-          python -m pip install grpcio-tools
-          mkdir -p /tmp/proto_check
-          python -m grpc_tools.protoc -I "$(dirname "$PROTO")" \
-            --python_out=/tmp/proto_check \
-            --grpc_python_out=/tmp/proto_check \
-            "$PROTO"
-          ls -1 /tmp/proto_check
+      # proto 是 Java/Python 的共享契约，必须**生成到工程目录**，不能只编译到临时目录。
+      #
+      # 踩过的坑：这里原本只把 proto 编译到 /tmp 做"能否编译"的校验，而生成物是被
+      # .gitignore 排除的。P02 起测试会 import app.grpc_gen_loader（加载生成的桩代码），
+      # 于是 CI 在**用例收集阶段**就报：
+      #   RuntimeError: 未找到 proto 生成物，请先在 python-rag 目录执行 make proto
+      # 本地因为跑过 make proto 而不复现，属于典型的"只有 CI 才炸"。
+      #
+      # make proto 顺带会校验两侧 protoc 版本一致（读 java-service/pom.xml），
+      # 所以它同时替代了原先的"可编译"校验。
+      - name: 生成 proto 代码（含两侧 protoc 版本一致性校验）
+        working-directory: python-rag
+        run: make proto PY=python3
 
       - name: 运行单元测试
         working-directory: python-rag

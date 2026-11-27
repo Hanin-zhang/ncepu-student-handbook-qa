@@ -54,7 +54,8 @@ serve:
 smoke:
 	$(PYRUN) ../scripts/smoke_grpc.py
 
-test:
+# test 依赖 proto：生成物不入库，clean clone 后直接 make test 也要能跑通
+test: proto
 	$(PYRUN) -m pytest -q
 
 clean:
