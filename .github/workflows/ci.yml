@@ -210,7 +210,67 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # 3. Web：Vue 3 + TypeScript + Element Plus（Vite）
+  # 3. 端到端：真正跑一次 scripts/verify-p02.sh
+  #
+  # 为什么单独一个 job，而不是并进上面的 java / python：
+  #   · java job 只证明"自己编译得动、单测过"，python job 只证明"自己生成得动、单测过"；
+  #     两者都绿，也完全可能**握手失败**——证书 SAN、TLS 版本、HTTP/2 协商这些
+  #     只有两个进程真的连上才暴露。
+  #   · P02 的核心验收就是这条链路，因此必须进 CI，而不是只在开发者机器上跑过。
+  #
+  # 脚本内部会：生成证书 → 两侧生成 proto → 起 Python（TLS）→ 纯 Python 冒烟 →
+  # Java 集成用例 → 停服务 → 验证 UNAVAILABLE 映射为 3001。
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: 端到端（Java ↔ Python TLS）
+    needs: detect
+    if: needs.detect.outputs.java == 'true' && needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-e2e-${{ hashFiles('python-rag/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-e2e-
+
+      # 依赖装进 setup-python 的解释器，不建 venv：
+      # verify-p02.sh 在检测不到 .venv 时会回退到 $PY_BIN，省掉建 venv 的时间。
+      - name: 安装 Python 依赖
+        run: python -m pip install -r python-rag/requirements.txt
+
+      - name: 运行 P02 端到端自测
+        run: PY_BIN="$(command -v python3)" bash scripts/verify-p02.sh
+
+      # 失败时把服务端日志与 surefire 报告带出来，否则只能看到一句断言消息
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p02-e2e-logs
+          path: |
+            .p02-server.log
+            java-service/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 4. Web：Vue 3 + TypeScript + Element Plus（Vite）
   # ---------------------------------------------------------------------------
   web:
     name: 前端

@@ -69,8 +69,14 @@ ok "证书就绪（CA / 服务端证书 / 私钥）"
 
 (cd "$JAVA_DIR" && mvn -B -ntp -q generate-sources)
 (cd "$PY_DIR" && make --no-print-directory proto PY="$PY_BIN" >/dev/null)
+# 解释器选择：优先用工程内 venv；CI 里通常没有 venv（依赖直接装在 setup-python 提供的
+# 解释器里），此时回退到 ${PY_BIN}，否则会出现"本地能跑、CI 报虚拟环境不存在"。
 PY_RUN="$PY_DIR/.venv/bin/python"
-[[ -x "$PY_RUN" ]] || fail "虚拟环境不存在：${PY_RUN}（先跑 scripts/verify-p01.sh 或 make deps）"
+if [[ ! -x "$PY_RUN" ]]; then
+  PY_RUN="$PY_BIN"
+  "$PY_RUN" -c 'import grpc, pytest' >/dev/null 2>&1 \
+    || fail "既没有 ${PY_DIR}/.venv，${PY_RUN} 也缺依赖（pip install -r python-rag/requirements.txt）"
+fi
 ok "两侧生成物就绪"
 
 # ---- 1. Python 单元测试（帧语义 + 配置校验）--------------------------------
