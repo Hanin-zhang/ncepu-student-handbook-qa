@@ -126,7 +126,9 @@ class AppPropertiesStartupTest {
         Throwable failure = catchThrowable(() -> nonWebApp().run(args.toArray(String[]::new)));
 
         assertThat(failure).as("缺少 HMAC_SECRET 时必须启动失败").isNotNull();
-        assertThat(allMessages(failure)).contains("HMAC_SECRET");
+        assertThat(allMessages(failure))
+                .as(() -> "实际失败信息：" + allMessages(failure))
+                .contains("HMAC_SECRET");
     }
 
     @ParameterizedTest(name = "缺 {0} 时启动失败并报出变量名")

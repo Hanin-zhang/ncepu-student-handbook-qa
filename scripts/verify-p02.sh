@@ -144,7 +144,9 @@ ok "Python 侧冒烟通过"
 
 # ---- 4. Java 集成用例（判据①② + 用例 test_chat_stream_frames）-------------
 step "4/6 Java：mvn test（集成用例连真实 TLS 服务）"
-(cd "$JAVA_DIR" && mvn -B -ntp -q test \
+# 用 clean 而非增量编译：实测增量编译在某些情况下会留下不完整的 target/classes，
+# 表现为 NoClassDefFoundError / 断言拿到空消息，且重跑就好——这种"薛定谔的绿"最耗排查时间。
+(cd "$JAVA_DIR" && mvn -B -ntp -q clean test \
   -Dp02.it=true -Dp02.host=127.0.0.1 -Dp02.port="$PORT" -Dp02.ca="$CA")
 ok "Java 集成用例通过（healthy=true / 帧序列正确）"
 
