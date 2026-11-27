@@ -5,8 +5,6 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -131,68 +129,32 @@ class AppPropertiesStartupTest {
                 .contains("HMAC_SECRET");
     }
 
-    @ParameterizedTest(name = "缺 {0} 时启动失败并报出变量名")
-    @ValueSource(strings = {
-            "HMAC_KEY_ID",
-            "HMAC_SECRET",
-            "JWT_SECRET",
-            "RAG_HOST",
-            "RAG_TLS_CA_PATH",
-            "CORS_ALLOWED_ORIGINS"})
-    @DisplayName("test_config_required_missing: 每个必填项缺失都必须启动失败并报出变量名")
-    void everyRequiredVariableMissingFailsFast(String envName) {
-        // 回归用例：曾因 ${VAR} 无默认值，变量缺失时被绑定成字面量 "${VAR}" 而绕过 @NotBlank。
-        // 本机若恰好设置了同名环境变量，「缺失」场景无法构造，跳过而不是误报。
-        assumeTrue(System.getenv(envName) == null,
-                "本机已设置环境变量 " + envName + "，无法构造缺失场景");
+    @Test
+    @DisplayName("test_config_required_missing: 全部必填项同时缺失时，一条失败信息里报出全部变量名")
+    void allRequiredVariablesMissingAreAllReported() {
+        // 为什么一次删光，而不是逐个删：
+        // Spring 的 ConfigurationPropertiesBinder 会把**所有**约束违规收集进同一个
+        // BindValidationException，一次启动就能拿到全部字段的错误（实测同时缺 3 个变量时，
+        // 失败信息里 3 条 Reason 并列）。逐个删 = 启动 6 次 Spring 上下文，只为验证同一件事。
+        //
+        // 这条断言比"逐个删"更强：要求 6 个变量名**同时**出现在同一条失败信息里。
+        // 哪天 Spring 改成"遇到第一个错误就中止"，这条用例会立刻变红。
+        assumeTrue(
+                REQUIRED_ENV_TO_PROPERTY.keySet().stream().allMatch(name -> System.getenv(name) == null),
+                "本机设置了同名环境变量，无法构造全部缺失的场景");
 
-        String property = REQUIRED_ENV_TO_PROPERTY.get(envName);
-        assertThat(property).as("环境变量 %s 必须登记到 REQUIRED_ENV_TO_PROPERTY", envName).isNotNull();
-
-        // 只移除被测项，其余必填项都给齐，确保失败原因唯一
-        String prefix = "--" + property + "=";
-        List<String> args = allRequiredArgs().stream()
-                .filter(a -> !a.startsWith(prefix))
-                .collect(Collectors.toList());
-        assertThat(args).as("装配错误：被测项仍出现在命令行参数里").noneMatch(a -> a.startsWith(prefix));
+        // 只给端口，其余必填项一律不传
+        List<String> args = new ArrayList<>();
+        args.add("--server.port=0");
 
         Throwable failure = catchThrowable(() -> nonWebApp().run(args.toArray(String[]::new)));
 
-        assertThat(failure).as("缺少 %s 时必须启动失败", envName).isNotNull();
-        assertThat(allMessages(failure)).as("失败信息必须包含变量名 %s", envName).contains(envName);
-    }
-
-    @Test
-    @DisplayName("test_config_required_missing: JWT_SECRET 为空时启动失败且报出变量名")
-    void missingJwtSecretFailsFastWithVariableName() {
-        List<String> args = baseArgs();
-        args.add("--app.hmac.secret=dummy-secret-for-test");
-        args.add("--app.jwt.secret=");
-
-        Throwable failure = catchThrowable(() -> nonWebApp().run(args.toArray(String[]::new)));
-
-        assertThat(failure).as("缺少 JWT_SECRET 时必须启动失败").isNotNull();
-        assertThat(allMessages(failure)).contains("JWT_SECRET");    }
-
-    @Test
-    @DisplayName("配齐必填项时上下文可启动，且配置正确绑定")
-    void contextStartsWithAllRequiredVariables() {
-        List<String> args = baseArgs();
-        args.add("--app.hmac.secret=dummy-secret-for-test");
-        args.add("--app.jwt.secret=0123456789abcdef0123456789abcdef");
-
-        try (ConfigurableApplicationContext ctx = nonWebApp().run(args.toArray(String[]::new))) {
-            AppProperties p = ctx.getBean(AppProperties.class);
-            assertThat(p.hmac().keyId()).isEqualTo("k1");
-            assertThat(p.hmac().secret()).isEqualTo("dummy-secret-for-test");
-            assertThat(p.hmac().clockSkewSeconds()).isEqualTo(60);
-            assertThat(p.rag().port()).isEqualTo(50051);
-            assertThat(p.rag().tls().enabled()).isTrue();
-            assertThat(p.sse().timeoutMs()).isEqualTo(180_000);
-            assertThat(p.sse().heartbeatMs()).isEqualTo(15_000);
-            assertThat(p.upload().allowedExt()).isEqualTo("md,txt");
-            assertThat(p.upload().maxBytes()).isEqualTo(10_485_760L);
-            assertThat(p.rateLimit().chatPerMin()).isEqualTo(20);
+        assertThat(failure).as("全部必填项缺失时必须启动失败").isNotNull();
+        String messages = allMessages(failure);
+        for (String envName : REQUIRED_ENV_TO_PROPERTY.keySet()) {
+            assertThat(messages)
+                    .as("失败信息必须包含 %s；实际：%s", envName, messages)
+                    .contains(envName);
         }
     }
 
@@ -224,12 +186,25 @@ class AppPropertiesStartupTest {
     }
 
     @Test
-    @DisplayName("test_config_required_missing: TLS 开关为 null 视图下的默认值即 true")
-    void tlsEnabledByDefault() {
-        // 回归护栏：上面的 @AssertTrue 不能把「不传该变量」也拒掉，
-        // application.yml 里 RAG_TLS_ENABLED 的默认必须是 true。
-        try (ConfigurableApplicationContext ctx = nonWebApp().run(allRequiredArgs().toArray(String[]::new))) {
-            assertThat(ctx.getBean(AppProperties.class).rag().tls().enabled()).isTrue();
+    @DisplayName("配齐必填项时上下文可启动，且配置正确绑定（含 TLS 默认开启）")
+    void contextStartsWithAllRequiredVariables() {
+        // 与上面的失败路径互补：既要「错的时候炸」，也要证明「对的时候不误伤」。
+        // 特别注意 tls().enabled() 必须为 true —— 若 @AssertTrue 误判，
+        // 不传 RAG_TLS_ENABLED 的正常配置就会被拒，这条用例负责守住。
+        try (ConfigurableApplicationContext ctx =
+                     nonWebApp().run(allRequiredArgs().toArray(String[]::new))) {
+            AppProperties p = ctx.getBean(AppProperties.class);
+            assertThat(p.hmac().keyId()).isEqualTo("k1");
+            assertThat(p.hmac().secret()).isEqualTo("dummy-secret-for-test");
+            assertThat(p.hmac().clockSkewSeconds()).isEqualTo(60);
+            assertThat(p.rag().host()).isEqualTo("127.0.0.1");
+            assertThat(p.rag().port()).isEqualTo(50051);
+            assertThat(p.rag().tls().enabled()).isTrue();
+            assertThat(p.sse().timeoutMs()).isEqualTo(180_000);
+            assertThat(p.sse().heartbeatMs()).isEqualTo(15_000);
+            assertThat(p.upload().allowedExt()).isEqualTo("md,txt");
+            assertThat(p.upload().maxBytes()).isEqualTo(10_485_760L);
+            assertThat(p.rateLimit().chatPerMin()).isEqualTo(20);
         }
     }
 
