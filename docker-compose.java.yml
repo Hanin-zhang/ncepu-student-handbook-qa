@@ -1,0 +1,34 @@
+# P01 骨架：Java 侧依赖的 MySQL。
+#
+# 说明：
+#   · 真正的单机终版 Compose 在 P12 交付（deploy/docker-compose.yml）；
+#     本文件只负责「本地把 MySQL 拉起来」，给 P05 的建表与上传闭环使用。
+#   · java-app 的镜像构建（Dockerfile）随 P12 提供，因此这里不声明 java-app，
+#     避免出现一个 build 必然失败的服务定义。
+#   · MySQL 只监听 127.0.0.1（NFR-07 精神，P12 再做全端口核对）。
+name: student-rag-java
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: student-rag-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-student_rag}
+      MYSQL_USER: ${JAVA_DB_USER:?请在 .env 中设置 JAVA_DB_USER}
+      MYSQL_PASSWORD: ${JAVA_DB_PASSWORD:?请在 .env 中设置 JAVA_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql-data:

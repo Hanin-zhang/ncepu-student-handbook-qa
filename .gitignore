@@ -1,0 +1,21 @@
+# ---------------- Java ----------------
+java-service/target/
+*.class
+
+# ---------------- Python ----------------
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# proto 生成物由 make proto 产生，禁止入库（避免手改生成代码）
+python-rag/app/grpc_gen/*.py
+python-rag/storage/
+
+# ---------------- 环境与密钥 ----------------
+.env
+
+# ---------------- 证书（P12 生成，不入库） ----------------
+deploy/certs/
+
+# ---------------- 系统 ----------------
+.DS_Store
