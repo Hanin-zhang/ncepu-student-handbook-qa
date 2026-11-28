@@ -177,28 +177,19 @@ jobs:
           # 测试框架单独装，避免项目依赖里漏掉
           pip install pytest pytest-asyncio pytest-cov
 
-      # proto 是 Java/Python 的共享契约，单独校验它能否编译，
-      # 这样即使业务代码还没写，契约写错也能第一时间发现
-      - name: 校验 .proto 可编译
-        working-directory: .
-        run: |
-          set -euo pipefail
-          PROTO=""
-          for p in python-rag/proto/rag_service.proto proto/rag_service.proto; do
-            if [ -f "$p" ]; then PROTO="$p"; break; fi
-          done
-          if [ -z "$PROTO" ]; then
-            echo "::notice::未找到 rag_service.proto，跳过契约校验"
-            exit 0
-          fi
-          echo "校验 $PROTO"
-          python -m pip install grpcio-tools
-          mkdir -p /tmp/proto_check
-          python -m grpc_tools.protoc -I "$(dirname "$PROTO")" \
-            --python_out=/tmp/proto_check \
-            --grpc_python_out=/tmp/proto_check \
-            "$PROTO"
-          ls -1 /tmp/proto_check
+      # proto 是 Java/Python 的共享契约，必须**生成到工程目录**，不能只编译到临时目录。
+      #
+      # 踩过的坑：这里原本只把 proto 编译到 /tmp 做"能否编译"的校验，而生成物是被
+      # .gitignore 排除的。P02 起测试会 import app.grpc_gen_loader（加载生成的桩代码），
+      # 于是 CI 在**用例收集阶段**就报：
+      #   RuntimeError: 未找到 proto 生成物，请先在 python-rag 目录执行 make proto
+      # 本地因为跑过 make proto 而不复现，属于典型的"只有 CI 才炸"。
+      #
+      # make proto 顺带会校验两侧 protoc 版本一致（读 java-service/pom.xml），
+      # 所以它同时替代了原先的"可编译"校验。
+      - name: 生成 proto 代码（含两侧 protoc 版本一致性校验）
+        working-directory: python-rag
+        run: make proto PY=python3
 
       - name: 运行单元测试
         working-directory: python-rag
@@ -219,7 +210,67 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # 3. Web：Vue 3 + TypeScript + Element Plus（Vite）
+  # 3. 端到端：真正跑一次 scripts/verify-p02.sh
+  #
+  # 为什么单独一个 job，而不是并进上面的 java / python：
+  #   · java job 只证明"自己编译得动、单测过"，python job 只证明"自己生成得动、单测过"；
+  #     两者都绿，也完全可能**握手失败**——证书 SAN、TLS 版本、HTTP/2 协商这些
+  #     只有两个进程真的连上才暴露。
+  #   · P02 的核心验收就是这条链路，因此必须进 CI，而不是只在开发者机器上跑过。
+  #
+  # 脚本内部会：生成证书 → 两侧生成 proto → 起 Python（TLS）→ 纯 Python 冒烟 →
+  # Java 集成用例 → 停服务 → 验证 UNAVAILABLE 映射为 3001。
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: 端到端（Java ↔ Python TLS）
+    needs: detect
+    if: needs.detect.outputs.java == 'true' && needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-e2e-${{ hashFiles('python-rag/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-e2e-
+
+      # 依赖装进 setup-python 的解释器，不建 venv：
+      # verify-p02.sh 在检测不到 .venv 时会回退到 $PY_BIN，省掉建 venv 的时间。
+      - name: 安装 Python 依赖
+        run: python -m pip install -r python-rag/requirements.txt
+
+      - name: 运行 P02 端到端自测
+        run: PY_BIN="$(command -v python3)" bash scripts/verify-p02.sh
+
+      # 失败时把服务端日志与 surefire 报告带出来，否则只能看到一句断言消息
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p02-e2e-logs
+          path: |
+            .p02-server.log
+            java-service/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 4. Web：Vue 3 + TypeScript + Element Plus（Vite）
   # ---------------------------------------------------------------------------
   web:
     name: 前端

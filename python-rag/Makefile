@@ -5,6 +5,8 @@
 #   make deps           安装 requirements.txt
 #   make proto          由 ../proto/rag_service.proto 生成 app/grpc_gen/*.py，
 #                       并校验两侧 protoc 版本一致（不一致则以非 0 退出）
+#   make serve          启动 gRPC 服务（TLS，需先 make proto 并备好证书）
+#   make smoke          对已启动的服务跑冒烟脚本
 #   make test           运行 pytest
 #   make clean          清理生成物与缓存
 #
@@ -22,7 +24,7 @@ PROTO_DIR  := ../proto
 PROTO_FILE := $(PROTO_DIR)/rag_service.proto
 GEN_DIR    := app/grpc_gen
 
-.PHONY: venv deps proto proto-version test clean
+.PHONY: venv deps proto proto-version serve smoke test clean
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -45,7 +47,15 @@ proto:
 proto-version:
 	@$(PYRUN) -m app.proto_version
 
-test:
+# 证书路径由 .env 或环境变量提供；默认指向仓库根的 deploy/certs（由 gen-dev-certs.sh 生成）
+serve:
+	$(PYRUN) -m app
+
+smoke:
+	$(PYRUN) ../scripts/smoke_grpc.py
+
+# test 依赖 proto：生成物不入库，clean clone 后直接 make test 也要能跑通
+test: proto
 	$(PYRUN) -m pytest -q
 
 clean:

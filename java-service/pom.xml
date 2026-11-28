@@ -30,6 +30,18 @@
     <grpc.version>1.65.1</grpc.version>
     <protobuf.version>3.25.1</protobuf.version>
     <protobuf-maven-plugin.version>0.6.1</protobuf-maven-plugin.version>
+    <!--
+      ★ 关闭 Maven 增量编译。
+
+      protoc 每次生成的是**整套**消息类（ChatChunk、它的 Builder、以及 javac 合成的
+      内部访问器 access$N）。只要有一次生成与编译不同步，就会出现：
+        NoSuchMethodError: 'boolean com.ncepu.rag.grpc.ChatChunk.access$7()'
+        NoClassDefFoundError / ClassNotFoundException
+      这类错误只在流式反序列化时才炸，看起来像协议问题，实则构建产物脏了。
+
+      项目类不多（几十个），全量编译只多几秒，换来"构建结果只取决于源码"。
+    -->
+    <maven.compiler.useIncrementalCompilation>false</maven.compiler.useIncrementalCompilation>
     <os-maven-plugin.version>1.7.1</os-maven-plugin.version>
   </properties>
 
@@ -118,6 +130,30 @@
         <configuration>
           <!-- 保留方法参数名，后续 Controller 的参数绑定与校验消息需要 -->
           <parameters>true</parameters>
+        </configuration>
+      </plugin>
+
+      <!--
+        ★ 必须显式包含 **/*IT.java。
+
+        Surefire 默认只匹配 *Test / Test* / *Tests / *TestCase，名字以 IT 结尾的
+        集成用例**一个都不会执行**——而脚本又打印"集成用例通过"，形成典型的假绿。
+        P02 首次联调就踩了：verify-p02.sh 第 4 步全绿，实际 RagServiceClientIT 从未运行。
+
+        这些 IT 自身用 @EnabledIfSystemProperty 控制是否启用（默认跳过），
+        所以加进 surefire 不会让日常 `mvn test` 变慢，也不会在无服务环境下失败。
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <includes>
+            <include>**/Test*.java</include>
+            <include>**/*Test.java</include>
+            <include>**/*Tests.java</include>
+            <include>**/*TestCase.java</include>
+            <include>**/*IT.java</include>
+          </includes>
         </configuration>
       </plugin>
 
